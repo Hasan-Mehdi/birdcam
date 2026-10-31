@@ -86,8 +86,18 @@ let stall = null, playing = false;
 video.addEventListener("playing", () => { playing = true; clearTimeout(stall); down.hidden = true; say(""); });
 video.addEventListener("waiting", () => { clearTimeout(stall); stall = setTimeout(() => down.hidden && say("Buffering…"), 1500); });
 
-function start() {
+async function start() {
   playing = false;
+  // Ask for the playlist ourselves first: with the Pi off, Discord's proxy answers 525 and
+  // hls.js retries a 5xx quietly for minutes without telling the page.
+  try {
+    const r = await fetch(SRC, { cache: "no-store" });
+    if (!r.ok) throw new Error(`playlist ${r.status}`);
+  } catch (e) {
+    showDown();
+    setTimeout(start, 20000);
+    return;
+  }
   if (window.Hls && Hls.isSupported()) {
     // No worker: the Activity's content policy may not allow blob: workers.
     // Whole segments with a 3-segment cushion: low-latency parts (~0.3 s each, ~0.2 s
@@ -95,11 +105,9 @@ function start() {
     const hls = new Hls({ enableWorker: false, lowLatencyMode: false, liveSyncDurationCount: 3,
                           manifestLoadingMaxRetry: 30, manifestLoadingRetryDelay: 2000 });
     hls.on(Hls.Events.ERROR, (_, d) => {
-      // hls.js retries a failed playlist itself; the first failure already means no stream
-      if (!playing && (d.type === Hls.ErrorTypes.NETWORK_ERROR || d.details === Hls.ErrorDetails.MANIFEST_PARSING_ERROR)) showDown();
       if (!d.fatal) return;
       if (playing) say("Reconnecting…");
-      hls.destroy(); setTimeout(start, down.hidden ? 3000 : 20000);
+      hls.destroy(); setTimeout(start, 3000);   // start() checks again and shows why if it's down
     });
     hls.loadSource(SRC);
     hls.attachMedia(video);
