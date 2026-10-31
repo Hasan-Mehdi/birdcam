@@ -119,14 +119,35 @@ setInterval(() => {
     `error ${diag.err || "none"}`, navigator.userAgent].join(String.fromCharCode(10));
 }, 1000);
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const LIVE_SYNC = 3;   // hls.js starts this many segments back from the live edge
+
+// Throws if the stream can't be reached. Otherwise waits until the media playlist holds
+// LIVE_SYNC real segments: MediaMTX starts its HLS muxer only when someone asks, and pads a new
+// muxer's playlist with #EXT-X-GAP placeholders; hls.js started then sits in the gap for good.
+async function streamReady() {
+  const r = await fetch(SRC, { cache: "no-store" });
+  if (!r.ok) throw new Error(`playlist ${r.status}`);
+  const variant = (await r.text()).split("\n").find(l => l.trim() && !l.startsWith("#"));
+  if (!variant) return;
+  const media = new URL(variant.trim(), r.url);
+  for (let i = 0; i < 20; i++) {
+    const m = await (await fetch(media, { cache: "no-store" })).text();
+    const real = (m.match(/^#EXTINF/gm) || []).length - (m.match(/^#EXT-X-GAP/gm) || []).length;
+    if (real >= LIVE_SYNC) return;
+    say("Starting the camera…");
+    await sleep(2000);
+  }
+}
+
+let hlsNow = null;
 async function start() {
   playing = false;
   diag.started = Date.now();
-  // Ask for the playlist ourselves first: with the Pi off, Discord's proxy answers 525 and
+  // Check the stream ourselves first: with the Pi off, Discord's proxy answers 525 and
   // hls.js retries a 5xx quietly for minutes without telling the page.
   try {
-    const r = await fetch(SRC, { cache: "no-store" });
-    if (!r.ok) throw new Error(`playlist ${r.status}`);
+    await streamReady();
   } catch (e) {
     showDown();
     setTimeout(start, 20000);
@@ -136,15 +157,17 @@ async function start() {
     // No worker: the Activity's content policy may not allow blob: workers.
     // Whole segments with a 3-segment cushion: low-latency parts (~0.3 s each, ~0.2 s
     // per request through Discord's proxy and the Funnel relay) kept stalling.
-    const hls = new Hls({ enableWorker: false, lowLatencyMode: false, liveSyncDurationCount: 3,
-                          manifestLoadingMaxRetry: 30, manifestLoadingRetryDelay: 2000 });
+    const hls = hlsNow = new Hls({ enableWorker: false, lowLatencyMode: false, liveSyncDurationCount: LIVE_SYNC,
+                                   manifestLoadingMaxRetry: 30, manifestLoadingRetryDelay: 2000 });
     hls.on(Hls.Events.FRAG_BUFFERED, () => { diag.frags++; });
     hls.on(Hls.Events.ERROR, (_, d) => {
       diag.err = `${d.details}${d.response && d.response.code ? " " + d.response.code : ""}${d.fatal ? " (fatal)" : ""}`;
       if (!d.fatal) return;
       if (playing) say("Reconnecting…");
-      hls.destroy(); setTimeout(start, 3000);   // start() checks again and shows why if it's down
+      hls.destroy(); hls.dead = true; setTimeout(start, 3000);   // start() checks again and shows why if it's down
     });
+    // backstop: a player that hasn't started 25 s in gets a fresh start
+    setTimeout(() => { if (!playing && hlsNow === hls && !hls.dead) { hls.destroy(); hls.dead = true; start(); } }, 25000);
     hls.loadSource(SRC);
     hls.attachMedia(video);
   } else {
