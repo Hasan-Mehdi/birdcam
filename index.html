@@ -17,6 +17,10 @@
             font: 13px/1.3 system-ui, sans-serif; color: #9fb8bf; background: rgba(11,17,20,.7);
             padding: 4px 8px; border-radius: 4px; }
   #status:empty { display: none; }
+  #info { position: fixed; left: calc(12px + var(--sail)); bottom: calc(40px + var(--saib)); max-width: 90vw;
+          font: 11px/1.35 ui-monospace, Consolas, monospace; color: #b9c6d3; white-space: pre-wrap;
+          background: rgba(11,17,20,.8); padding: 6px 8px; border-radius: 4px; }
+  #info:empty { display: none; }
   #down { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
           justify-content: center; gap: 8px; padding: var(--sait) 16px calc(var(--saib) + 8vh);
           text-align: center; font-family: system-ui, sans-serif; color: #e8e4da;
@@ -27,12 +31,19 @@
   #down h1 { margin: 0; font-size: clamp(20px, 5vw, 34px); font-weight: 600; text-shadow: 0 2px 0 #05080e; }
   #down p { margin: 0; font-size: clamp(13px, 3vw, 17px); color: #b9c6d3; text-shadow: 0 1px 0 #05080e; }
   #down b { color: #e8a33d; font-weight: 600; }
+  #tap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+         background: rgba(6,9,14,.45); border: 0; padding: 0; cursor: pointer; }
+  #tap[hidden] { display: none; }
+  #tap span { font: 600 17px/1 system-ui, sans-serif; color: #171207; background: #e8a33d;
+              padding: 14px 22px; border-radius: 999px; }
 </style>
 </head>
 <body>
 <video id="v" autoplay muted playsinline></video>
+<button id="tap" hidden><span>&#9654; Tap to watch</span></button>
 <div id="down" hidden><h1 id="downTitle"></h1><p id="downText"></p></div>
 <div id="status">Connecting…</div>
+<div id="info"></div>
 <script src="sdk.js"></script>
 <script src="hls.min.js"></script>
 <script>
@@ -83,11 +94,34 @@ setInterval(() => { if (!down.hidden) showDown(); }, 30000);
 
 // short stalls are normal through Discord's proxy; only say so if one lasts
 let stall = null, playing = false;
-video.addEventListener("playing", () => { playing = true; clearTimeout(stall); down.hidden = true; say(""); });
-video.addEventListener("waiting", () => { clearTimeout(stall); stall = setTimeout(() => down.hidden && say("Buffering…"), 1500); });
+video.addEventListener("playing", () => { playing = true; clearTimeout(stall); down.hidden = true; tap.hidden = true; say(""); });
+video.addEventListener("waiting", () => { clearTimeout(stall); stall = setTimeout(() => down.hidden && tap.hidden && say("Buffering…"), 1500); });
+
+// Android's in-app browser (Discord's mobile app) can refuse to start even a muted video
+// without a tap; offer one instead of sitting on "Buffering…".
+const tap = document.getElementById("tap");
+function play() {
+  video.play().then(() => { diag.play = "ok"; tap.hidden = true; }).catch(e => {
+    diag.play = e.name;
+    if (e.name === "NotAllowedError") { tap.hidden = false; clearTimeout(stall); say(""); }
+  });
+}
+document.addEventListener("click", () => { if (!playing) play(); });
+
+// If the video hasn't started 10 s in, show what the player sees, so a screenshot from a
+// phone (where there are no dev tools) says why.
+const diag = { started: 0, frags: 0, err: "", play: "" }, info = document.getElementById("info");
+setInterval(() => {
+  if (playing || !down.hidden || Date.now() - diag.started < 10000) { info.textContent = ""; return; }
+  const b = video.buffered, mode = window.Hls && Hls.isSupported() ? "mse" : "native";
+  info.textContent = [`hls ${window.Hls ? Hls.version : "-"} ${mode}  ready ${video.readyState} net ${video.networkState} paused ${video.paused} t ${video.currentTime.toFixed(1)}`,
+    `buffered ${b.length ? b.start(0).toFixed(1) + "-" + b.end(b.length - 1).toFixed(1) + " x" + b.length : "none"}  frags ${diag.frags}  play ${diag.play || "pending"}`,
+    `error ${diag.err || "none"}`, navigator.userAgent].join(String.fromCharCode(10));
+}, 1000);
 
 async function start() {
   playing = false;
+  diag.started = Date.now();
   // Ask for the playlist ourselves first: with the Pi off, Discord's proxy answers 525 and
   // hls.js retries a 5xx quietly for minutes without telling the page.
   try {
@@ -104,7 +138,9 @@ async function start() {
     // per request through Discord's proxy and the Funnel relay) kept stalling.
     const hls = new Hls({ enableWorker: false, lowLatencyMode: false, liveSyncDurationCount: 3,
                           manifestLoadingMaxRetry: 30, manifestLoadingRetryDelay: 2000 });
+    hls.on(Hls.Events.FRAG_BUFFERED, () => { diag.frags++; });
     hls.on(Hls.Events.ERROR, (_, d) => {
+      diag.err = `${d.details}${d.response && d.response.code ? " " + d.response.code : ""}${d.fatal ? " (fatal)" : ""}`;
       if (!d.fatal) return;
       if (playing) say("Reconnecting…");
       hls.destroy(); setTimeout(start, 3000);   // start() checks again and shows why if it's down
@@ -115,7 +151,7 @@ async function start() {
     video.src = SRC;  // Safari / iOS play HLS natively
     video.addEventListener("error", () => { showDown(); setTimeout(start, 20000); }, { once: true });
   }
-  video.play().catch(() => {});
+  play();
 }
 start();
 </script>
